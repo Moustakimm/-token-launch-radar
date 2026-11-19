@@ -151,6 +151,21 @@ export interface RadarRow {
   chain_multiplier: number;
   size_multiplier: number;
   watchlist: boolean;
+  verdict: 'FARM' | 'MARGINAL' | 'SKIP';
+  farm_value_usd: number;
+}
+
+/** Every protocol in the snapshot, accounted for in exactly one bucket. */
+export interface Disposition {
+  total: number;
+  ranked: number;
+  has_token: number;
+  bridge: number;
+  liquid_staking: number;
+  exchange_custody: number;
+  versioned: number;
+  wrapped: number;
+  other: number;
 }
 
 export interface LiveRow {
@@ -175,6 +190,13 @@ export interface RadarData {
   live_size: number;
   top_implied_usd: number;
   median_implied_usd: number;
+  implied_total_usd: number;
+  implied_top10_low_usd: number;
+  multiple_min: number;
+  multiple_max: number;
+  disposition: Disposition;
+  verdict_counts: { farm: number; marginal: number; skip: number };
+  best_farm_value_usd: number;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -329,6 +351,48 @@ function capitalFor(p: SnapshotProtocol): number {
 function sizingNote(p: SnapshotProtocol): string {
   if (p.change_7d === null || p.change_7d >= -10) return '';
   return ` TVL fell ${Math.abs(p.change_7d).toFixed(1)}% in the last seven days, so this plan starts at half the usual size.`;
+}
+
+/**
+ * A row's farm verdict, from the model's own outputs only. FARM is a strong
+ * implied multiple on a growing protocol; MARGINAL is a decent multiple or
+ * fast growth; the rest is SKIP. The rule never names a protocol.
+ */
+export function farmVerdict(impliedMultiple: number, change7d: number | null): 'FARM' | 'MARGINAL' | 'SKIP' {
+  if (impliedMultiple >= 0.5 && change7d !== null && change7d > 0) return 'FARM';
+  if (impliedMultiple >= 0.3 || (change7d !== null && change7d > 5)) return 'MARGINAL';
+  return 'SKIP';
+}
+
+/**
+ * The dollar value a farm plan is chasing: the plan's own capital times the
+ * row's implied multiple. A $50 plan on a 1.03x protocol chases $51.50 of
+ * launch value; a $250 plan on a 0.11x protocol chases $27.50. It is the
+ * value the stake is tied to, not a promised payout.
+ */
+export function farmValueUsd(p: SnapshotProtocol, impliedMultiple: number): number {
+  return Math.round(capitalFor(p) * impliedMultiple * 100) / 100;
+}
+
+/**
+ * Every protocol in the snapshot, in exactly one bucket. The buckets are
+ * the rankable rule's own exclusions, in priority order: ranked first, then
+ * already has a token, then the excluded categories and name shapes. The
+ * counts sum to the snapshot's protocol count, so nothing is unaccounted for.
+ */
+export function disposition(snapshot: Snapshot): Disposition {
+  const d: Disposition = { total: snapshot.protocols.length, ranked: 0, has_token: 0, bridge: 0, liquid_staking: 0, exchange_custody: 0, versioned: 0, wrapped: 0, other: 0 };
+  for (const p of snapshot.protocols) {
+    if (isRankable(p)) d.ranked++;
+    else if (!isPreToken(p)) d.has_token++;
+    else if (p.category === 'Bridge' || p.category === 'Canonical Bridge') d.bridge++;
+    else if (p.category === 'Liquid Staking' || p.category === 'Liquid Restaking' || p.category === 'Restaked BTC') d.liquid_staking++;
+    else if (p.category === 'CEX') d.exchange_custody++;
+    else if (VERSIONED.test(p.name)) d.versioned++;
+    else if (WRAPPED_WORD.test(p.name)) d.wrapped++;
+    else d.other++;
+  }
+  return d;
 }
 
 function holdDaysFor(age: number | null): number {
@@ -497,6 +561,8 @@ export function radarRow(row: BoardRow): RadarRow {
     chain_multiplier: row.model.chain_multiplier,
     size_multiplier: row.model.size_multiplier,
     watchlist: row.watchlist,
+    verdict: farmVerdict(row.model.implied_multiple, row.change_7d),
+    farm_value_usd: farmValueUsd({ slug: row.slug, name: row.name, category: row.category, chains: row.chains, tvl_usd: row.tvl_usd, change_7d: row.change_7d, mcap_usd: row.mcap_usd, listed_at: row.listed_at, gecko_id: row.gecko_id, symbol: row.symbol }, row.model.implied_multiple),
   };
 }
 
@@ -506,6 +572,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const early = board.filter((r) => !r.watchlist).length;
   const sortedImplied = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
   const median = sortedImplied.length ? sortedImplied[Math.floor(sortedImplied.length / 2)]! : 0;
+  const rows = board.map(radarRow);
+  const verdicts = { farm: 0, marginal: 0, skip: 0 };
+  for (const r of rows) verdicts[r.verdict === 'FARM' ? 'farm' : r.verdict === 'MARGINAL' ? 'marginal' : 'skip']++;
+  const multiples = rows.map((r) => r.implied_multiple);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -518,7 +588,14 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live_size: live.length,
     top_implied_usd: board.length ? board[0]!.implied_value_usd : 0,
     median_implied_usd: median,
-    rows: board.map(radarRow),
+    implied_total_usd: rows.reduce((a, r) => a + r.implied_value_usd, 0),
+    implied_top10_low_usd: rows.length >= 10 ? rows[9]!.implied_value_usd : 0,
+    multiple_min: multiples.length ? Math.min(...multiples) : 0,
+    multiple_max: multiples.length ? Math.max(...multiples) : 0,
+    disposition: disposition(snapshot),
+    verdict_counts: verdicts,
+    best_farm_value_usd: rows.length ? Math.max(...rows.map((r) => r.farm_value_usd)) : 0,
+    rows,
     live,
   };
   return { board, radar };
