@@ -1,4 +1,4 @@
-// Token Radar model radar-2: one snapshot in, one ranked board out.
+// Token Radar model radar-3: one snapshot in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a
 // ceiling) and every other rankable pre-token protocol in the snapshot, however
@@ -18,23 +18,30 @@
 // Implied value follows only from the snapshot's own figures, in one function
 // that scores every protocol alike. No name is ever special-cased.
 //
-//   base         = tvl_usd x 0.25
+//   base         = tvl_usd x 0.30
+//   size         = (100,000,000 / tvl_usd) ^ 0.25
+//                  (a launch's value grows with TVL but with diminishing
+//                  returns: doubling TVL does not double the value of a
+//                  launch, because the largest protocols are the most mature
+//                  and the most crowded, so a mid-size protocol can outrank a
+//                  giant on the strength of its growth and seasoning)
 //   growth       = clamp(change_7d, -60, 150) per cent
-//   growthMult   = 1 + (growth / 100) x 0.8
-//   maturity     = 0.60 + 0.40 x sqrt(min(age_days, 1095) / 1095)
-//                  (age unknown: 365 days, maturity 0.83)
+//   growthMult   = 1 + (growth / 100) x 1.0
+//   maturity     = 0.50 + 0.50 x sqrt(min(age_days, 1095) / 1095)
+//                  (age unknown: 365 days, maturity 0.79)
 //   chainMult    = 1 + 0.03 x min(chains - 1, 5)        (1.00 to 1.15)
-//   implied      = max(1, round(base x growthMult x maturity x chainMult))
+//   implied      = max(1, round(base x size x growthMult x maturity x chainMult))
 //
 // Why these shapes: growth is the strongest signal in a 7-day window, so it
 // can move the multiple more than twofold; maturity rises with age but with
 // diminishing returns, because a protocol that has run two years with no token
 // is more seasoned than one listed last month, not twice as valuable; chain
 // breadth is a small reach bonus, capped, because a protocol live on five
-// chains reaches more farmers than one on a single chain. The implied/TVL
-// multiple therefore runs from about 0.08 (shrinking, young, single-chain)
-// to about 0.63 (fast-growing, seasoned, multi-chain), and the ranking is
-// not a TVL table: growth, age and reach reorder it.
+// chains reaches more farmers than one on a single chain. Size dampening
+// keeps the board from being a TVL table: on this snapshot the implied/TVL
+// multiple runs from about 0.11 (huge, shrinking, young, single-chain) to
+// just over 1.0 (small, fast-growing, seasoned, multi-chain), and the ranking
+// is decided by growth and seasoning among protocols of similar size.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -68,22 +75,26 @@ export interface ModelConstants {
   unknown_age_days: number;
   chain_step: number;
   chain_max_chains: number;
+  size_reference_usd: number;
+  size_exponent: number;
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
-  growth_weight: 0.8,
+  base_multiple: 0.3,
+  growth_weight: 1.0,
   growth_floor: -60,
   growth_cap: 150,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
+  maturity_floor: 0.5,
+  maturity_range: 0.5,
   maturity_days: 1095,
   unknown_age_days: 365,
   chain_step: 0.03,
   chain_max_chains: 5,
+  size_reference_usd: 100_000_000,
+  size_exponent: 0.25,
 };
 
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 export const LIVE_ROWS = 24;
 
 export interface FarmStep {
@@ -114,6 +125,7 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     chain_multiplier: number;
+    size_multiplier: number;
     implied_multiple: number;
     age_days: number | null;
   };
@@ -137,6 +149,7 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  size_multiplier: number;
   watchlist: boolean;
 }
 
@@ -191,7 +204,7 @@ export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-): { implied: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; multiple: number; age: number | null } {
+): { implied: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; sizeMult: number; multiple: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -202,9 +215,10 @@ export function impliedValue(
     model.maturity_range * Math.sqrt(Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days);
   const chainCount = Math.max(1, protocol.chains.length);
   const chainMult = 1 + model.chain_step * Math.min(chainCount - 1, model.chain_max_chains);
+  const sizeMult = Math.pow(model.size_reference_usd / Math.max(1, protocol.tvl_usd), model.size_exponent);
   const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult));
-  return { implied, growthPct, growthMult, maturityMult, chainMult, multiple: implied / Math.max(1, protocol.tvl_usd), age };
+  const implied = Math.max(1, Math.round(base * sizeMult * growthMult * maturityMult * chainMult));
+  return { implied, growthPct, growthMult, maturityMult, chainMult, sizeMult, multiple: implied / Math.max(1, protocol.tvl_usd), age };
 }
 
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
@@ -281,6 +295,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       chain_multiplier: round4(s.chainMult),
+      size_multiplier: round4(s.sizeMult),
       implied_multiple: round4(s.multiple),
       age_days: s.age,
     },
@@ -302,10 +317,18 @@ function chainOf(p: SnapshotProtocol): string {
 }
 
 function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 150;
-  if (p.tvl_usd >= 100_000_000) return 100;
-  return 50;
+  const base =
+    p.tvl_usd >= 5_000_000_000 ? 250 : p.tvl_usd >= 1_000_000_000 ? 150 : p.tvl_usd >= 100_000_000 ? 100 : 50;
+  // TVL falling hard: the farm starts at half size, because the protocol is
+  // losing deposits while you would be adding them.
+  if (p.change_7d !== null && p.change_7d < -10) return Math.max(25, Math.round(base / 2));
+  return base;
+}
+
+/** The note a falling protocol's plan carries, or '' when TVL is not falling hard. */
+function sizingNote(p: SnapshotProtocol): string {
+  if (p.change_7d === null || p.change_7d >= -10) return '';
+  return ` TVL fell ${Math.abs(p.change_7d).toFixed(1)}% in the last seven days, so this plan starts at half the usual size.`;
 }
 
 function holdDaysFor(age: number | null): number {
@@ -398,8 +421,10 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
 
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time.
- * The plan is derived from the protocol's own record (category, chains, TVL
- * and age), never from a hand-written list of names.
+ * The plan is derived from the protocol's own record (category, chains, TVL,
+ * growth and age), never from a hand-written list of names. A protocol whose
+ * TVL fell more than 10% in the last seven days farms at half size, and the
+ * plan says so.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -411,7 +436,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
-    { text: actionFor(p, capital, chain), cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`, time: '15 minutes to set up' },
+    { text: `${actionFor(p, capital, chain)}${sizingNote(p)}`, cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`, time: '15 minutes to set up' },
     { text: secondActionFor(p, capital, chain), cost: `about $${Math.max(10, Math.round(capital / 5))} of capital and about $2 of gas`, time: '10 minutes' },
     {
       text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote, and never do them all in one day.`,
@@ -470,6 +495,7 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    size_multiplier: row.model.size_multiplier,
     watchlist: row.watchlist,
   };
 }

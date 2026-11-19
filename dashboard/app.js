@@ -1,4 +1,4 @@
-// Token Radar radar-2 dashboard. Reads window.RADAR (written beside
+// Token Radar radar-3 dashboard. Reads window.RADAR (written beside
 // dashboard/ by main.ts) and renders the ranked board, a filterable table,
 // a top-10 chart, a model sandbox that recomputes every row live, and a
 // per-protocol detail view with the model's own inputs and the farm plan.
@@ -11,7 +11,7 @@
   var app = document.getElementById('board');
   var baseModel = DATA.model;
   var state = { q: '', category: 'all', chain: 'all', watch: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null, sandbox: false, m: null };
-  state.m = { base_multiple: baseModel.base_multiple, growth_weight: baseModel.growth_weight, maturity_range: baseModel.maturity_range, chain_step: baseModel.chain_step };
+  state.m = { base_multiple: baseModel.base_multiple, growth_weight: baseModel.growth_weight, maturity_range: baseModel.maturity_range, chain_step: baseModel.chain_step, size_exponent: baseModel.size_exponent };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -28,19 +28,20 @@
   // The model, in one function, identical to lib/model.ts: the page
   // recomputes a row from the snapshot figures and checks the number the
   // board carries, so the page's code and the board's data are visibly the
-  // same arithmetic. The sandbox changes only the four constants below.
+  // same arithmetic. The sandbox changes only the five constants below.
   function impliedOf(row, m) {
     var growth = Math.min(150, Math.max(-60, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * m.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? 365 : row.age_days;
-    var maturity = 0.6 + m.maturity_range * Math.sqrt(Math.min(Math.max(age, 0), 1095) / 1095);
+    var maturity = 0.5 + m.maturity_range * Math.sqrt(Math.min(Math.max(age, 0), 1095) / 1095);
     var chains = Math.max(1, row.chain_count || (row.chains ? row.chains.length : 1));
     var chainMult = 1 + m.chain_step * Math.min(chains - 1, 5);
-    return { implied: Math.max(1, Math.round(row.tvl_usd * m.base_multiple * growthMult * maturity * chainMult)), growthMult: growthMult, maturity: maturity, chainMult: chainMult, growth: growth };
+    var sizeMult = Math.pow(100000000 / Math.max(1, row.tvl_usd), m.size_exponent);
+    return { implied: Math.max(1, Math.round(row.tvl_usd * m.base_multiple * sizeMult * growthMult * maturity * chainMult)), growthMult: growthMult, maturity: maturity, chainMult: chainMult, sizeMult: sizeMult, growth: growth };
   }
   function liveRows() {
     if (!state.sandbox) return DATA.rows;
-    var scored = DATA.rows.map(function (r) { var v = impliedOf(r, state.m); var c = {}; for (var k in r) c[k] = r[k]; c.implied_value_usd = v.implied; c.implied_multiple = v.implied / Math.max(1, r.tvl_usd); c.growth_multiplier = Math.round(v.growthMult * 1e4) / 1e4; c.maturity_multiplier = Math.round(v.maturity * 1e4) / 1e4; c.chain_multiplier = Math.round(v.chainMult * 1e4) / 1e4; return c; });
+    var scored = DATA.rows.map(function (r) { var v = impliedOf(r, state.m); var c = {}; for (var k in r) c[k] = r[k]; c.implied_value_usd = v.implied; c.implied_multiple = v.implied / Math.max(1, r.tvl_usd); c.growth_multiplier = Math.round(v.growthMult * 1e4) / 1e4; c.maturity_multiplier = Math.round(v.maturity * 1e4) / 1e4; c.chain_multiplier = Math.round(v.chainMult * 1e4) / 1e4; c.size_multiplier = Math.round(v.sizeMult * 1e4) / 1e4; return c; });
     scored.sort(function (a, b) { return b.implied_value_usd - a.implied_value_usd || (a.slug < b.slug ? -1 : 1); });
     scored.forEach(function (r, i) { r.rank = i + 1; });
     return scored;
@@ -63,7 +64,8 @@
   // chains, TVL and age decide the actions, the capital, the hold and every
   // cost and time. No name is special-cased.
   function chainOf(p) { return p.chains && p.chains.length ? p.chains[0] : 'its main chain'; }
-  function capitalFor(p) { if (p.tvl_usd >= 5e9) return 250; if (p.tvl_usd >= 1e9) return 150; if (p.tvl_usd >= 1e8) return 100; return 50; }
+  function capitalFor(p) { var base; if (p.tvl_usd >= 5e9) base = 250; else if (p.tvl_usd >= 1e9) base = 150; else if (p.tvl_usd >= 1e8) base = 100; else base = 50; if (p.change_7d !== null && p.change_7d !== undefined && p.change_7d < -10) return Math.max(25, Math.round(base / 2)); return base; }
+  function sizingNote(p) { if (p.change_7d === null || p.change_7d === undefined || p.change_7d >= -10) return ''; return ' TVL fell ' + Math.abs(p.change_7d).toFixed(1) + '% in the last seven days, so this plan starts at half the usual size.'; }
   function holdFor(age) { if (age === null || age === undefined) return 30; if (age < 180) return 60; if (age < 365) return 45; return 30; }
   function group(p) {
     var c = (p.category || '').toLowerCase();
@@ -115,7 +117,7 @@
     var chain = chainOf(p), cap = capitalFor(p), hold = holdFor(p.age_days);
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline on paper, never in a screenshot or a chat.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, cap, chain), cost: '$' + cap + ' of capital and about $' + (cap >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
+      { text: actionFor(p, cap, chain) + sizingNote(p), cost: '$' + cap + ' of capital and about $' + (cap >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
       { text: secondFor(p, cap, chain), cost: 'about $' + Math.max(10, Math.round(cap / 5)) + ' of capital and about $2 of gas', time: '10 minutes' },
       { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote, and never do them all in one day.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw early to chase another farm.', cost: 'the $' + cap + ' stays in the position', time: hold + ' days' },
@@ -267,8 +269,8 @@
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
-      el('div', { class: 'formula' }, 'implied = round( tvl_usd x ', el('b', { text: String(m.base_multiple) }), ' x (1 + clamp(change_7d, -60, 150) / 100 x ', el('b', { text: String(m.growth_weight) }), ') x (0.60 + 0.40 x sqrt(min(age_days, 1095) / 1095)) x (1 + 0.03 x min(chains - 1, 5)) )'),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses 365 days. Growth can move the multiple more than twofold, maturity rises with age but with diminishing returns, and chain breadth adds at most 15%. The sandbox below changes only these constants and re-ranks the whole board live.' }));
+      el('div', { class: 'formula' }, 'implied = round( tvl_usd x ', el('b', { text: String(m.base_multiple) }), ' x (100,000,000 / tvl_usd) ^ ', el('b', { text: String(m.size_exponent) }), ' x (1 + clamp(change_7d, -60, 150) / 100 x ', el('b', { text: String(m.growth_weight) }), ') x (0.50 + 0.50 x sqrt(min(age_days, 1095) / 1095)) x (1 + 0.03 x min(chains - 1, 5)) )'),
+      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses 365 days. Value grows with TVL but with diminishing returns — doubling TVL does not double the value of a launch — so growth and seasoning decide the order among protocols of similar size. Growth can move the multiple more than twofold, maturity rises with age but with diminishing returns, and chain breadth adds at most 15%. The sandbox below changes only these constants and re-ranks the whole board live.' }));
   }
   function sandbox() {
     var m = state.m;
@@ -278,15 +280,16 @@
       input.addEventListener('input', function () { m[key] = parseFloat(input.value); state.sandbox = true; out.textContent = fmt(m[key]); render(); });
       return el('label', null, label, input, out);
     }
-    var reset = el('button', { class: 'button', type: 'button', text: 'Reset to radar-2', onclick: function () { state.m = { base_multiple: baseModel.base_multiple, growth_weight: baseModel.growth_weight, maturity_range: baseModel.maturity_range, chain_step: baseModel.chain_step }; state.sandbox = false; render(); } });
+    var reset = el('button', { class: 'button', type: 'button', text: 'Reset to radar-3', onclick: function () { state.m = { base_multiple: baseModel.base_multiple, growth_weight: baseModel.growth_weight, maturity_range: baseModel.maturity_range, chain_step: baseModel.chain_step, size_exponent: baseModel.size_exponent }; state.sandbox = false; render(); } });
     return el('section', { class: 'panel sandbox' },
       el('h2', { text: 'Model sandbox — change the model, watch the board move' }),
-      el('p', { class: 'note', text: state.sandbox ? 'Sandbox on: ranks below are recomputed with your constants. The submitted board still carries radar-2.' : 'Drag a slider: every row is recomputed from its TVL, growth, age and chains, and the board re-sorts. Nothing here is a hard-coded list.' }),
+      el('p', { class: 'note', text: state.sandbox ? 'Sandbox on: ranks below are recomputed with your constants. The submitted board still carries radar-3.' : 'Drag a slider: every row is recomputed from its TVL, growth, age and chains, and the board re-sorts. Nothing here is a hard-coded list.' }),
       el('div', { class: 'sandbox-grid' },
         slider('Base multiple', 'base_multiple', 0.1, 0.4, 0.01, function (v) { return v.toFixed(2); }),
         slider('Growth weight', 'growth_weight', 0, 1.5, 0.1, function (v) { return v.toFixed(1); }),
         slider('Maturity range', 'maturity_range', 0, 0.6, 0.05, function (v) { return v.toFixed(2); }),
-        slider('Chain step', 'chain_step', 0, 0.06, 0.01, function (v) { return v.toFixed(2); })),
+        slider('Chain step', 'chain_step', 0, 0.06, 0.01, function (v) { return v.toFixed(2); }),
+        slider('Size exponent', 'size_exponent', 0, 0.5, 0.05, function (v) { return v.toFixed(2); })),
       reset);
   }
   function method() {
@@ -297,16 +300,17 @@
   }
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
+  function chainList(p) { var ch = p.chains || []; if (!ch.length) return 'an unnamed chain'; if (ch.length <= 4) return ch.join(', '); return ch.slice(0, 4).join(', ') + ' and ' + (ch.length - 4) + ' more'; }
   function openDetail(slug) {
     var row = liveRows().filter(function (r) { return r.slug === slug; })[0];
     if (!row) return;
     state.selected = slug; writeHash(); dialog.textContent = '';
     var steps = farmSteps(row);
     var v = impliedOf(row, state.sandbox ? state.m : baseModel);
-    var zero = Math.max(1, Math.round(row.tvl_usd * (state.sandbox ? state.m.base_multiple : baseModel.base_multiple) * 1 * v.maturity * v.chainMult));
+    var zero = Math.max(1, Math.round(row.tvl_usd * (state.sandbox ? state.m.base_multiple : baseModel.base_multiple) * v.sizeMult * 1 * v.maturity * v.chainMult));
     var why = row.change_7d !== null && row.change_7d > 20 ? 'Fast 7-day growth lifts it above larger, slower protocols.' : row.change_7d !== null && row.change_7d < -10 ? 'Its 7-day fall holds it back despite its size.' : 'Its size and age carry it; growth neither lifts nor holds it back.';
     dialog.appendChild(el('div', { class: 'detail-head' },
-      el('div', null, el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.watchlist ? ' — Watchlist' : ' — Early radar') }), el('h2', { id: 'detail-title', text: row.name }), el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })),
+      el('div', null, el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.watchlist ? ' — Watchlist' : ' — Early radar') }), el('h2', { id: 'detail-title', text: row.name }), el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + chainList(row) })),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
@@ -318,9 +322,10 @@
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Chain multiplier' }), el('b', { class: 'num', text: String(row.chain_multiplier) })),
+        el('div', null, el('span', { text: 'Size multiplier' }), el('b', { class: 'num', text: String(row.size_multiplier) })),
         el('div', null, el('span', { text: 'Implied / TVL' }), el('b', { class: 'num', text: fmtMult(row.implied_multiple) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(v.implied) + (v.implied === row.implied_value_usd ? ', the same number the board carries.' : ', which differs from the board while the sandbox is on.') + ' At zero growth it would be ' + fmtUsd(zero) + '. ' + why + ' This is an estimate, not a price.' })));
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ' recomputes this row as ' + fmtUsd(v.implied) + (v.implied === row.implied_value_usd ? ', the same number the board carries.' : ', which differs from the board while the sandbox is on.') + ' At zero growth it would be ' + fmtUsd(zero) + '. ' + why })));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan — 7 steps' }),
       el('ol', { class: 'steps' }, steps.map(function (s) { var at = s.indexOf(' Cost: '); var a = at >= 0 ? s.slice(0, at) : s; var t = at >= 0 ? s.slice(at + 1) : ''; return el('li', null, el('b', { text: a }), el('span', { class: 'cost', text: t })); }))));
